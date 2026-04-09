@@ -226,7 +226,9 @@ fn compute_inode_csum(
     let seed = crc32c::crc32c(fs_uuid);
     let seed = crc32c::crc32c_append(seed, &inode_num.to_le_bytes());
     let seed = crc32c::crc32c_append(seed, &generation.to_le_bytes());
-    crc32c::crc32c_append(seed, &buf)
+    // The crc32c crate's crc32c_append returns a raw running CRC without final
+    // inversion. ext4's stored checksum is the bitwise complement of that value.
+    !crc32c::crc32c_append(seed, &buf)
 }
 
 // ---------- Inode lookup ----------
@@ -371,9 +373,9 @@ fn main() -> Result<()> {
         .with_context(|| format!("reading donor inode {}", donor_ino))?;
 
         let d = DonorTs {
-            atime:  ts_from_buf(&dbuf, 0x08, 0x88),
+            atime:  ts_from_buf(&dbuf, 0x08, 0x8C),
             ctime:  ts_from_buf(&dbuf, 0x0C, 0x84),
-            mtime:  ts_from_buf(&dbuf, 0x10, 0x8C),
+            mtime:  ts_from_buf(&dbuf, 0x10, 0x88),
             crtime: ts_from_buf(&dbuf, 0x90, 0x94),
         };
 
@@ -406,8 +408,8 @@ fn main() -> Result<()> {
         args.inode, inode_offset
     );
     println!("[+] current timestamps:");
-    println!("    atime  = {}.{:09}", ts_from_buf(&inode_buf, 0x08, 0x88).0, ts_from_buf(&inode_buf, 0x08, 0x88).1);
-    println!("    mtime  = {}.{:09}", ts_from_buf(&inode_buf, 0x10, 0x8C).0, ts_from_buf(&inode_buf, 0x10, 0x8C).1);
+    println!("    atime  = {}.{:09}", ts_from_buf(&inode_buf, 0x08, 0x8C).0, ts_from_buf(&inode_buf, 0x08, 0x8C).1);
+    println!("    mtime  = {}.{:09}", ts_from_buf(&inode_buf, 0x10, 0x88).0, ts_from_buf(&inode_buf, 0x10, 0x88).1);
     println!("    ctime  = {}.{:09}", ts_from_buf(&inode_buf, 0x0C, 0x84).0, ts_from_buf(&inode_buf, 0x0C, 0x84).1);
     println!("    crtime = {}.{:09}", ts_from_buf(&inode_buf, 0x90, 0x94).0, ts_from_buf(&inode_buf, 0x90, 0x94).1);
     println!("    generation = {:#x}", generation);
@@ -424,7 +426,7 @@ fn main() -> Result<()> {
     //    inode are fixed by the struct layout above.
     //
     //    i_atime at 0x08, i_ctime at 0x0C, i_mtime at 0x10
-    //    i_atime_extra at 0x88, i_ctime_extra at 0x84, i_mtime_extra at 0x8C
+    //    i_ctime_extra at 0x84, i_mtime_extra at 0x88, i_atime_extra at 0x8C
     //    i_crtime at 0x90, i_crtime_extra at 0x94
     fn patch(buf: &mut [u8], offset: usize, xtime: i32, extra_off: usize, extra: u32) {
         buf[offset..offset + 4].copy_from_slice(&xtime.to_le_bytes());
@@ -442,12 +444,12 @@ fn main() -> Result<()> {
     }
     if let Some((secs, nsec)) = eff_mtime {
         let (x, e) = encode_timestamp(secs, nsec);
-        patch(&mut inode_buf, 0x10, x, 0x8C, e);
+        patch(&mut inode_buf, 0x10, x, 0x88, e);
         println!("[+] setting mtime  = {}.{:09} ({})", secs, nsec, source_label(args.mtime.is_some()));
     }
     if let Some((secs, nsec)) = eff_atime {
         let (x, e) = encode_timestamp(secs, nsec);
-        patch(&mut inode_buf, 0x08, x, 0x88, e);
+        patch(&mut inode_buf, 0x08, x, 0x8C, e);
         println!("[+] setting atime  = {}.{:09} ({})", secs, nsec, source_label(args.atime.is_some()));
     }
     if let Some((secs, nsec)) = eff_crtime {
@@ -475,15 +477,37 @@ fn main() -> Result<()> {
     } else {
         // Sanity check: refuse to write if device looks like it's mounted.
         // On Linux, opening /dev/sdXN O_RDWR succeeds even when mounted, so
-        // we check /proc/mounts as a guardrail.
+        // we check /proc/mounts as a guardrail. We also check loop backing
+        // files in /sys/block/loopN/loop/backing_file so that image files
+        // mounted via losetup are caught too.
+        let dev_str = args.device.to_string_lossy();
+        let dev_canonical = std::fs::canonicalize(&args.device)
+            .unwrap_or_else(|_| args.device.clone());
         if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
-            let dev_str = args.device.to_string_lossy();
             for line in mounts.lines() {
-                if line.starts_with(dev_str.as_ref()) {
+                let mount_dev = line.split_whitespace().next().unwrap_or("");
+                // Direct match: e.g. /dev/sda1 or /dev/loop0 used as device
+                if mount_dev == dev_str.as_ref() || mount_dev == dev_canonical.to_string_lossy().as_ref() {
                     return Err(anyhow!(
                         "{} appears mounted — refusing to write. Unmount first.",
                         dev_str
                     ));
+                }
+                // Loop device match: check backing_file for each loopN in mounts
+                if mount_dev.starts_with("/dev/loop") {
+                    let loop_name = mount_dev.trim_start_matches("/dev/");
+                    let backing = format!("/sys/block/{}/loop/backing_file", loop_name);
+                    if let Ok(path) = std::fs::read_to_string(&backing) {
+                        let backing_path = path.trim();
+                        if backing_path == dev_str.as_ref()
+                            || backing_path == dev_canonical.to_string_lossy().as_ref()
+                        {
+                            return Err(anyhow!(
+                                "{} is mounted via {} — refusing to write. Unmount first.",
+                                dev_str, mount_dev
+                            ));
+                        }
+                    }
                 }
             }
         }
