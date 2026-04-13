@@ -34,7 +34,7 @@ PAHOLE      := $(shell which pahole 2>/dev/null)
 # Attempt BTF-based detection
 define get_offset_btf
 $(shell $(PAHOLE) --btf_base=$(1) -C ext4_inode_info 2>/dev/null | \
-	awk '/$(2)[[:space:]]*;/{gsub(/.*\//,"",$$0); match($$0,/\/\* *([0-9]+)/,a); print a[1]}')
+	awk '/$(2)[[:space:]]*;/{if (match($$0,/\/\* *([0-9]+)/,a)) print a[1]}')
 endef
 
 # Attempt pahole from kernel headers (generate minimal probe)

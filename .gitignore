@@ -1,1 +1,22 @@
-/target
+debug
+target
+
+# Kernel module build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.mod.o
+*.cmd
+*.symvers
+Module.symvers
+modules.order
+
+# Kbuild temp dirs/files
+.tmp_versions/
+
+# Userspace build output
+ext4ts_ctl
+
+# Local tooling/state
+.codex

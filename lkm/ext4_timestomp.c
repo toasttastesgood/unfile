@@ -33,6 +33,7 @@
 #include <linux/time64.h>
 #include <linux/kprobes.h>
 #include <linux/string.h>
+#include <linux/pagemap.h>
 
 /* Pull in the shared ioctl header (also used by userspace clients). */
 #include "ext4ts.h"
@@ -108,8 +109,8 @@ static unsigned long sym_addr(const char *name)
 /* --------------------------------------------------------------------------
  * Superblock iteration helpers
  * --------------------------------------------------------------------------
- * iterate_supers() is exported.  We use it to find the superblock that
- * corresponds to the requested block device.
+ * iterate_supers_type() is exported. We use it to find the ext4 superblock
+ * that corresponds to the requested block device.
  */
 struct find_sb_ctx {
 	dev_t        target_dev;
@@ -123,8 +124,8 @@ static void find_sb_cb(struct super_block *sb, void *arg)
 	if (ctx->found)
 		return; /* already found */
 
-	/* Match by block device number */
-	if (sb->s_bdev && sb->s_bdev->bd_dev == ctx->target_dev)
+	/* Match by superblock device number */
+	if (sb->s_dev == ctx->target_dev)
 		ctx->found = sb;
 }
 
@@ -212,7 +213,15 @@ static int do_stomp(struct ext4ts_req __user *ureq)
 
 		ctx.target_dev = bdev_dev;
 		ctx.found = NULL;
-		iterate_supers(find_sb_cb, &ctx);
+			{
+				struct file_system_type *ext4_type =
+					(struct file_system_type *)sym_addr("ext4_fs_type");
+				if (!ext4_type) {
+					pr_err("ext4_timestomp: ext4_fs_type not found via kallsyms\n");
+					return -ENOENT;
+				}
+				iterate_supers_type(ext4_type, find_sb_cb, &ctx);
+			}
 		if (!ctx.found) {
 			pr_err("ext4_timestomp: no mounted fs found for dev %u:%u\n",
 			       MAJOR(bdev_dev), MINOR(bdev_dev));

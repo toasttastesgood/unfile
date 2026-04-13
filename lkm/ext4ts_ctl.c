@@ -154,7 +154,7 @@ int main(int argc, char *argv[])
 
 	printf("ext4ts_ctl: target device=%s inode=%"PRIu64"\n", device, ino);
 	if (req.donor_ino)
-		printf("  donor inode: %"PRIu64"\n", req.donor_ino);
+		printf("  donor inode: %" PRIu64 "\n", (uint64_t)req.donor_ino);
 
 	if (dry_run) {
 		printf("[dry-run] would apply:\n");
