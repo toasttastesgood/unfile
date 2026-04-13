@@ -18,7 +18,6 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 // ---------- Superblock ----------
@@ -34,29 +33,28 @@ const INCOMPAT_64BIT: u32 = 0x80;
 const RO_COMPAT_METADATA_CSUM: u32 = 0x400;
 
 #[repr(C, packed)]
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct Superblock {
     s_inodes_count: u32,
     s_blocks_count_lo: u32,
     _pad1: [u8; 16],
-    s_log_block_size: u32,         // block size = 1024 << this
+    s_log_block_size: u32,         // block size = 1024 << this; at 0x18
     _pad2: [u8; 4],
-    s_blocks_per_group: u32,
+    s_blocks_per_group: u32,       // at 0x20
     _pad3: [u8; 4],
-    s_inodes_per_group: u32,
+    s_inodes_per_group: u32,       // at 0x28
     _pad4: [u8; 12],
-    s_magic: u16,
-    _pad5: [u8; 34],
-    s_inode_size: u16,             // size of on-disk inode struct (usually 256)
+    s_magic: u16,                  // at 0x38
+    _pad5: [u8; 30],               // 58..87 → puts s_inode_size at 0x58
+    s_inode_size: u16,             // at 0x58; size of on-disk inode struct (usually 256)
     _pad6: [u8; 2],
-    s_feature_compat: u32,
-    s_feature_incompat: u32,
-    s_feature_ro_compat: u32,
-    s_uuid: [u8; 16],              // needed for checksum seed
-    _pad7: [u8; 118],
-    s_desc_size: u16,              // group descriptor size (32 or 64)
-    _pad8: [u8; 636],              // pad out to 1024
-    s_checksum_seed: u32,          // if metadata_csum_seed set, else derived from uuid
+    s_feature_compat: u32,         // at 0x5C
+    s_feature_incompat: u32,       // at 0x60
+    s_feature_ro_compat: u32,      // at 0x64
+    s_uuid: [u8; 16],              // at 0x68; needed for checksum seed
+    _pad7: [u8; 134],              // 120..253 → puts s_desc_size at 0xFE
+    s_desc_size: u16,              // at 0xFE; group descriptor size (32 or 64)
+    _pad8: [u8; 768],              // 256..1023 → total = 1024
 }
 
 // sanity: superblock is 1024 bytes
@@ -82,7 +80,7 @@ impl Superblock {
 // inodes for that group live.
 
 #[repr(C, packed)]
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct GroupDesc64 {
     bg_block_bitmap_lo: u32,
     bg_inode_bitmap_lo: u32,
@@ -110,7 +108,7 @@ const _: () = assert!(std::mem::size_of::<GroupDesc64>() == 64);
 // Easier: just define the full struct and index by field.
 
 #[repr(C, packed)]
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 struct Ext4Inode {
     i_mode: u16,
     i_uid: u16,
@@ -180,6 +178,20 @@ fn encode_timestamp(secs: i64, nsec: u32) -> (i32, u32) {
     (xtime, extra)
 }
 
+fn decode_timestamp(xtime: i32, extra: u32) -> (i64, u32) {
+    let epoch_bits = (extra & 0x3) as i64;
+    let secs = (xtime as i64) | (epoch_bits << 32);
+    let nsec = (extra >> 2) & 0x3FFF_FFFF;
+    (secs, nsec)
+}
+
+// Read a timestamp pair from a raw inode buffer at the given byte offsets.
+fn ts_from_buf(buf: &[u8], off: usize, extra_off: usize) -> (i64, u32) {
+    let xtime = i32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+    let extra = u32::from_le_bytes(buf[extra_off..extra_off + 4].try_into().unwrap());
+    decode_timestamp(xtime, extra)
+}
+
 // ---------- Inode checksum ----------
 //
 // ext4 metadata_csum uses CRC32C. The inode checksum is computed over the
@@ -214,7 +226,53 @@ fn compute_inode_csum(
     let seed = crc32c::crc32c(fs_uuid);
     let seed = crc32c::crc32c_append(seed, &inode_num.to_le_bytes());
     let seed = crc32c::crc32c_append(seed, &generation.to_le_bytes());
-    crc32c::crc32c_append(seed, &buf)
+    // The crc32c crate's crc32c_append returns a raw running CRC without final
+    // inversion. ext4's stored checksum is the bitwise complement of that value.
+    !crc32c::crc32c_append(seed, &buf)
+}
+
+// ---------- Inode lookup ----------
+//
+// Shared by target and donor reads: given an inode number and the filesystem
+// parameters extracted from the superblock, locate the inode on disk, read
+// its full on-disk bytes, and return (buffer, disk_byte_offset).
+
+fn read_inode(
+    dev: &mut std::fs::File,
+    inode_num: u64,
+    block_size: u64,
+    inode_size: u64,
+    inodes_per_group: u64,
+    desc_size: u64,
+) -> Result<(Vec<u8>, u64)> {
+    if inode_num == 0 {
+        bail!("inode 0 is invalid");
+    }
+
+    let group = (inode_num - 1) / inodes_per_group;
+    let index_in_group = (inode_num - 1) % inodes_per_group;
+
+    let gdt_start_block = if block_size == 1024 { 2 } else { 1 };
+    let gdt_offset = gdt_start_block * block_size + group * desc_size;
+
+    let mut gd_buf = vec![0u8; desc_size as usize];
+    dev.seek(SeekFrom::Start(gdt_offset))?;
+    dev.read_exact(&mut gd_buf)?;
+
+    let inode_table_lo = u32::from_le_bytes(gd_buf[8..12].try_into().unwrap()) as u64;
+    let inode_table_hi = if desc_size >= 64 {
+        u32::from_le_bytes(gd_buf[40..44].try_into().unwrap()) as u64
+    } else {
+        0
+    };
+    let inode_table_block = (inode_table_hi << 32) | inode_table_lo;
+    let inode_offset = inode_table_block * block_size + index_in_group * inode_size;
+
+    let mut buf = vec![0u8; inode_size as usize];
+    dev.seek(SeekFrom::Start(inode_offset))?;
+    dev.read_exact(&mut buf)?;
+
+    Ok((buf, inode_offset))
 }
 
 // ---------- CLI ----------
@@ -250,6 +308,11 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     nsec: u32,
 
+    /// Donor inode: copy timestamps from this inode instead of specifying them
+    /// manually. Explicit --ctime/--mtime/--atime/--crtime args take precedence.
+    #[arg(long)]
+    donor: Option<u32>,
+
     /// Dry run — read and show what we'd write, but don't write
     #[arg(long)]
     dry_run: bool,
@@ -270,10 +333,10 @@ fn main() -> Result<()> {
         bail!("not an ext2/3/4 filesystem (bad magic {:#x})", { sb.s_magic });
     }
     let block_size = sb.block_size();
-    let inode_size = { sb.s_inode_size } as u64;
-    let inodes_per_group = { sb.s_inodes_per_group } as u64;
+    let inode_size = ({ sb.s_inode_size }) as u64;
+    let inodes_per_group = ({ sb.s_inodes_per_group }) as u64;
     let desc_size = if sb.has_64bit() {
-        { sb.s_desc_size } as u64
+        ({ sb.s_desc_size }) as u64
     } else {
         32
     };
@@ -289,97 +352,113 @@ fn main() -> Result<()> {
         bail!("inode size {} < 256, no crtime/nsec fields available", inode_size);
     }
 
-    // 2. Locate the group descriptor for our inode
-    //
-    // Inodes are numbered starting from 1. Block group = (ino-1) / inodes_per_group.
-    // Index within group = (ino-1) % inodes_per_group.
-    let ino = args.inode as u64;
-    if ino == 0 {
-        bail!("inode 0 is invalid");
+    // 2. If a donor inode was specified, read it and decode its timestamps.
+    //    These become the defaults for fields not overridden by explicit args.
+    struct DonorTs {
+        atime: (i64, u32),
+        mtime: (i64, u32),
+        ctime: (i64, u32),
+        crtime: (i64, u32),
     }
-    let group = (ino - 1) / inodes_per_group;
-    let index_in_group = (ino - 1) % inodes_per_group;
 
-    // Group descriptor table lives in the block right after the superblock.
-    // For 1K blocks, SB is in block 1, GDT starts block 2. For 4K blocks, SB
-    // occupies block 0 (first 1024 bytes) and GDT starts block 1.
-    let gdt_start_block = if block_size == 1024 { 2 } else { 1 };
-    let gdt_offset = gdt_start_block * block_size + group * desc_size;
+    let donor_ts: Option<DonorTs> = if let Some(donor_ino) = args.donor {
+        let (dbuf, _) = read_inode(
+            &mut dev,
+            donor_ino as u64,
+            block_size,
+            inode_size,
+            inodes_per_group,
+            desc_size,
+        )
+        .with_context(|| format!("reading donor inode {}", donor_ino))?;
 
-    // Read enough of the descriptor to get inode_table_lo/hi. GroupDesc64
-    // covers both 32- and 64-byte cases because we only read the first fields
-    // we need; _pad2 gets truncated harmlessly on 32-byte descriptors.
-    let mut gd_buf = vec![0u8; desc_size as usize];
-    dev.seek(SeekFrom::Start(gdt_offset))?;
-    dev.read_exact(&mut gd_buf)?;
+        let d = DonorTs {
+            atime:  ts_from_buf(&dbuf, 0x08, 0x8C),
+            ctime:  ts_from_buf(&dbuf, 0x0C, 0x84),
+            mtime:  ts_from_buf(&dbuf, 0x10, 0x88),
+            crtime: ts_from_buf(&dbuf, 0x90, 0x94),
+        };
 
-    let inode_table_lo = u32::from_le_bytes(gd_buf[8..12].try_into().unwrap()) as u64;
-    let inode_table_hi = if desc_size >= 64 {
-        u32::from_le_bytes(gd_buf[40..44].try_into().unwrap()) as u64
+        println!("[+] donor inode {} timestamps:", donor_ino);
+        println!("    atime  = {}.{:09}", d.atime.0,  d.atime.1);
+        println!("    mtime  = {}.{:09}", d.mtime.0,  d.mtime.1);
+        println!("    ctime  = {}.{:09}", d.ctime.0,  d.ctime.1);
+        println!("    crtime = {}.{:09}", d.crtime.0, d.crtime.1);
+
+        Some(d)
     } else {
-        0
+        None
     };
-    let inode_table_block = (inode_table_hi << 32) | inode_table_lo;
-    let inode_offset = inode_table_block * block_size + index_in_group * inode_size;
 
-    println!(
-        "[+] inode {} -> group {}, index {}, table block {}, byte offset {:#x}",
-        args.inode, group, index_in_group, inode_table_block, inode_offset
-    );
-
-    // 3. Read the full inode (inode_size bytes, not just size_of::<Ext4Inode>)
-    let mut inode_buf = vec![0u8; inode_size as usize];
-    dev.seek(SeekFrom::Start(inode_offset))?;
-    dev.read_exact(&mut inode_buf)?;
+    // 3. Locate the target inode.
+    let (mut inode_buf, inode_offset) = read_inode(
+        &mut dev,
+        args.inode as u64,
+        block_size,
+        inode_size,
+        inodes_per_group,
+        desc_size,
+    )?;
 
     let inode: Ext4Inode = unsafe { std::ptr::read_unaligned(inode_buf.as_ptr() as *const _) };
-
-    let cur_ctime = { inode.i_ctime };
-    let cur_crtime = { inode.i_crtime };
-    let cur_mtime = { inode.i_mtime };
-    let cur_atime = { inode.i_atime };
     let generation = { inode.i_generation };
 
+    println!(
+        "[+] target inode {} (byte offset {:#x})",
+        args.inode, inode_offset
+    );
     println!("[+] current timestamps:");
-    println!("    atime  = {}", cur_atime);
-    println!("    mtime  = {}", cur_mtime);
-    println!("    ctime  = {}", cur_ctime);
-    println!("    crtime = {}", cur_crtime);
+    println!("    atime  = {}.{:09}", ts_from_buf(&inode_buf, 0x08, 0x8C).0, ts_from_buf(&inode_buf, 0x08, 0x8C).1);
+    println!("    mtime  = {}.{:09}", ts_from_buf(&inode_buf, 0x10, 0x88).0, ts_from_buf(&inode_buf, 0x10, 0x88).1);
+    println!("    ctime  = {}.{:09}", ts_from_buf(&inode_buf, 0x0C, 0x84).0, ts_from_buf(&inode_buf, 0x0C, 0x84).1);
+    println!("    crtime = {}.{:09}", ts_from_buf(&inode_buf, 0x90, 0x94).0, ts_from_buf(&inode_buf, 0x90, 0x94).1);
     println!("    generation = {:#x}", generation);
 
-    // 4. Patch the timestamps in our local buffer. Field offsets within the
+    // 4. Compute effective (secs, nsec) for each field.
+    //    Precedence: explicit arg > donor > leave unchanged.
+    //    Explicit args use the global --nsec; donor values carry per-field nsec.
+    let eff_atime:  Option<(i64, u32)> = args.atime .map(|s| (s, args.nsec)).or_else(|| donor_ts.as_ref().map(|d| d.atime));
+    let eff_mtime:  Option<(i64, u32)> = args.mtime .map(|s| (s, args.nsec)).or_else(|| donor_ts.as_ref().map(|d| d.mtime));
+    let eff_ctime:  Option<(i64, u32)> = args.ctime .map(|s| (s, args.nsec)).or_else(|| donor_ts.as_ref().map(|d| d.ctime));
+    let eff_crtime: Option<(i64, u32)> = args.crtime.map(|s| (s, args.nsec)).or_else(|| donor_ts.as_ref().map(|d| d.crtime));
+
+    // 5. Patch the timestamps in our local buffer. Field offsets within the
     //    inode are fixed by the struct layout above.
     //
     //    i_atime at 0x08, i_ctime at 0x0C, i_mtime at 0x10
-    //    i_atime_extra at 0x88, i_ctime_extra at 0x84, i_mtime_extra at 0x8C
+    //    i_ctime_extra at 0x84, i_mtime_extra at 0x88, i_atime_extra at 0x8C
     //    i_crtime at 0x90, i_crtime_extra at 0x94
     fn patch(buf: &mut [u8], offset: usize, xtime: i32, extra_off: usize, extra: u32) {
         buf[offset..offset + 4].copy_from_slice(&xtime.to_le_bytes());
         buf[extra_off..extra_off + 4].copy_from_slice(&extra.to_le_bytes());
     }
 
-    if let Some(secs) = args.ctime {
-        let (x, e) = encode_timestamp(secs, args.nsec);
-        patch(&mut inode_buf, 0x0C, x, 0x84, e);
-        println!("[+] setting ctime  = {}.{:09}", secs, args.nsec);
-    }
-    if let Some(secs) = args.mtime {
-        let (x, e) = encode_timestamp(secs, args.nsec);
-        patch(&mut inode_buf, 0x10, x, 0x8C, e);
-        println!("[+] setting mtime  = {}.{:09}", secs, args.nsec);
-    }
-    if let Some(secs) = args.atime {
-        let (x, e) = encode_timestamp(secs, args.nsec);
-        patch(&mut inode_buf, 0x08, x, 0x88, e);
-        println!("[+] setting atime  = {}.{:09}", secs, args.nsec);
-    }
-    if let Some(secs) = args.crtime {
-        let (x, e) = encode_timestamp(secs, args.nsec);
-        patch(&mut inode_buf, 0x90, x, 0x94, e);
-        println!("[+] setting crtime = {}.{:09}", secs, args.nsec);
+    fn source_label(from_explicit: bool) -> &'static str {
+        if from_explicit { "explicit" } else { "donor" }
     }
 
-    // 5. Recompute the inode checksum if the filesystem uses metadata_csum.
+    if let Some((secs, nsec)) = eff_ctime {
+        let (x, e) = encode_timestamp(secs, nsec);
+        patch(&mut inode_buf, 0x0C, x, 0x84, e);
+        println!("[+] setting ctime  = {}.{:09} ({})", secs, nsec, source_label(args.ctime.is_some()));
+    }
+    if let Some((secs, nsec)) = eff_mtime {
+        let (x, e) = encode_timestamp(secs, nsec);
+        patch(&mut inode_buf, 0x10, x, 0x88, e);
+        println!("[+] setting mtime  = {}.{:09} ({})", secs, nsec, source_label(args.mtime.is_some()));
+    }
+    if let Some((secs, nsec)) = eff_atime {
+        let (x, e) = encode_timestamp(secs, nsec);
+        patch(&mut inode_buf, 0x08, x, 0x8C, e);
+        println!("[+] setting atime  = {}.{:09} ({})", secs, nsec, source_label(args.atime.is_some()));
+    }
+    if let Some((secs, nsec)) = eff_crtime {
+        let (x, e) = encode_timestamp(secs, nsec);
+        patch(&mut inode_buf, 0x90, x, 0x94, e);
+        println!("[+] setting crtime = {}.{:09} ({})", secs, nsec, source_label(args.crtime.is_some()));
+    }
+
+    // 6. Recompute the inode checksum if the filesystem uses metadata_csum.
     if sb.has_metadata_csum() {
         let csum = compute_inode_csum(&inode_buf, &sb.s_uuid, args.inode, generation);
         let lo = (csum & 0xFFFF) as u16;
@@ -392,21 +471,43 @@ fn main() -> Result<()> {
         println!("[+] new inode checksum = {:#010x}", csum);
     }
 
-    // 6. Write it back.
+    // 7. Write it back.
     if args.dry_run {
         println!("[!] dry run — not writing");
     } else {
         // Sanity check: refuse to write if device looks like it's mounted.
         // On Linux, opening /dev/sdXN O_RDWR succeeds even when mounted, so
-        // we check /proc/mounts as a guardrail.
+        // we check /proc/mounts as a guardrail. We also check loop backing
+        // files in /sys/block/loopN/loop/backing_file so that image files
+        // mounted via losetup are caught too.
+        let dev_str = args.device.to_string_lossy();
+        let dev_canonical = std::fs::canonicalize(&args.device)
+            .unwrap_or_else(|_| args.device.clone());
         if let Ok(mounts) = std::fs::read_to_string("/proc/mounts") {
-            let dev_str = args.device.to_string_lossy();
             for line in mounts.lines() {
-                if line.starts_with(dev_str.as_ref()) {
+                let mount_dev = line.split_whitespace().next().unwrap_or("");
+                // Direct match: e.g. /dev/sda1 or /dev/loop0 used as device
+                if mount_dev == dev_str.as_ref() || mount_dev == dev_canonical.to_string_lossy().as_ref() {
                     return Err(anyhow!(
                         "{} appears mounted — refusing to write. Unmount first.",
                         dev_str
                     ));
+                }
+                // Loop device match: check backing_file for each loopN in mounts
+                if mount_dev.starts_with("/dev/loop") {
+                    let loop_name = mount_dev.trim_start_matches("/dev/");
+                    let backing = format!("/sys/block/{}/loop/backing_file", loop_name);
+                    if let Ok(path) = std::fs::read_to_string(&backing) {
+                        let backing_path = path.trim();
+                        if backing_path == dev_str.as_ref()
+                            || backing_path == dev_canonical.to_string_lossy().as_ref()
+                        {
+                            return Err(anyhow!(
+                                "{} is mounted via {} — refusing to write. Unmount first.",
+                                dev_str, mount_dev
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -415,6 +516,5 @@ fn main() -> Result<()> {
         println!("[+] wrote inode back to disk");
     }
 
-    let _ = generation; // silence unused in some paths
     Ok(())
 }
