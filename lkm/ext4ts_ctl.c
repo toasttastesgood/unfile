@@ -29,6 +29,7 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/random.h>
 #include <getopt.h>
 #include <time.h>
 #include <inttypes.h>
@@ -49,12 +50,27 @@ static void usage(const char *prog)
 		"  --mtime   SECS   set mtime\n"
 		"  --ctime   SECS   set ctime\n"
 		"  --crtime  SECS   set crtime/birth time\n"
-		"  --nsec    NSEC   nanoseconds for all explicit timestamps (default 0)\n"
+		"  --nsec    NSEC   nanoseconds for all explicit timestamps (default random)\n"
 		"  --dry-run        print what would be done, do not call ioctl\n"
 		"  --help\n"
 		"\n"
 		"Requires the ext4_timestomp kernel module to be loaded.\n",
 		prog);
+}
+
+static uint32_t random_nsec(void)
+{
+	uint32_t v;
+	ssize_t n = getrandom(&v, sizeof(v), 0);
+
+	if (n != (ssize_t)sizeof(v)) {
+		struct timespec ts;
+
+		clock_gettime(CLOCK_REALTIME, &ts);
+		v = (uint32_t)ts.tv_nsec ^ (uint32_t)getpid();
+	}
+
+	return v % 1000000000U;
 }
 
 static void print_ts(const char *label, const struct ext4ts_ts *ts, const char *src)
@@ -80,6 +96,7 @@ int main(int argc, char *argv[])
 	const char *device  = NULL;
 	uint64_t    ino     = 0;
 	uint32_t    nsec    = 0;
+	int         nsec_set = 0;
 	int         dry_run = 0;
 
 	/* Track which timestamps were set explicitly (for annotation) */
@@ -129,6 +146,7 @@ int main(int argc, char *argv[])
 			break;
 		case 'n':
 			nsec = (uint32_t)strtoul(optarg, NULL, 10);
+			nsec_set = 1;
 			break;
 		case 'r': dry_run = 1; break;
 		case 'h': usage(argv[0]); return 0;
@@ -143,10 +161,10 @@ int main(int argc, char *argv[])
 	}
 
 	/* Apply nsec to all explicitly-set timestamps */
-	if (explicit_atime)  req.atime.nsec  = nsec;
-	if (explicit_mtime)  req.mtime.nsec  = nsec;
-	if (explicit_ctime)  req.ctime.nsec  = nsec;
-	if (explicit_crtime) req.crtime.nsec = nsec;
+	if (explicit_atime)  req.atime.nsec  = nsec_set ? nsec : random_nsec();
+	if (explicit_mtime)  req.mtime.nsec  = nsec_set ? nsec : random_nsec();
+	if (explicit_ctime)  req.ctime.nsec  = nsec_set ? nsec : random_nsec();
+	if (explicit_crtime) req.crtime.nsec = nsec_set ? nsec : random_nsec();
 
 	/* Fill request */
 	strncpy(req.dev, device, sizeof(req.dev) - 1);

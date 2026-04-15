@@ -8,10 +8,10 @@
 #include <linux/namei.h>
 #include <linux/string.h>
 #include <linux/pagemap.h>
-#include <linux/kprobes.h>
 #include <linux/blkdev.h>
 
 #include "xfsts.h"
+#include "timestomp_kmod_common.h"
 
 #if defined(XFS_VFS_INODE_OFFSET)
 #define XFSTS_HAVE_XFS_IGET_OFFSETS 1
@@ -31,69 +31,16 @@
 #endif
 #endif
 
-typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
-static kallsyms_lookup_name_t xfsts_kallsyms_lookup_name;
+static timestomp_kallsyms_lookup_name_t xfsts_kallsyms_lookup_name;
 typedef int (*xfs_iget_t)(void *mp, void *tp, __u64 ino, unsigned int flags,
 			  unsigned int lock_flags, void **ipp);
 typedef void (*xfs_irele_t)(void *ip);
-
-struct find_sb_ctx {
-	dev_t target_dev;
-	struct super_block *found;
-};
-
-static int __init resolve_kallsyms(void)
-{
-	struct kprobe kp = {
-		.symbol_name = "kallsyms_lookup_name",
-	};
-	int ret;
-
-	ret = register_kprobe(&kp);
-	if (ret < 0)
-		return ret;
-
-	xfsts_kallsyms_lookup_name = (kallsyms_lookup_name_t)kp.addr;
-	unregister_kprobe(&kp);
-	return 0;
-}
 
 static unsigned long sym_addr(const char *name)
 {
 	if (!xfsts_kallsyms_lookup_name)
 		return 0;
-	return xfsts_kallsyms_lookup_name(name);
-}
-
-static void find_sb_cb(struct super_block *sb, void *arg)
-{
-	struct find_sb_ctx *ctx = arg;
-
-	if (ctx->found)
-		return;
-	if ((sb->s_bdev && sb->s_bdev->bd_dev == ctx->target_dev) ||
-	    sb->s_dev == ctx->target_dev)
-		ctx->found = sb;
-}
-
-static void apply_vfs_ts(struct inode *inode, const struct xfsts_ts *ts, char which)
-{
-	struct timespec64 t = {
-		.tv_sec = ts->secs,
-		.tv_nsec = ts->nsec,
-	};
-
-	switch (which) {
-	case 'a':
-		inode_set_atime_to_ts(inode, t);
-		break;
-	case 'm':
-		inode_set_mtime_to_ts(inode, t);
-		break;
-	case 'c':
-		inode_set_ctime_to_ts(inode, t);
-		break;
-	}
+	return timestomp_sym_addr(xfsts_kallsyms_lookup_name, name);
 }
 
 static int read_btime(struct inode *inode, struct xfsts_ts *out)
@@ -193,7 +140,7 @@ static int do_stomp(struct xfsts_req __user *ureq, bool require_path_target)
 	struct super_block *sb;
 	struct inode *target = NULL;
 	struct inode *donor = NULL;
-	struct find_sb_ctx ctx;
+	struct timestomp_find_sb_ctx ctx;
 	struct file_system_type *xfs_type;
 	int ret;
 
@@ -224,7 +171,8 @@ static int do_stomp(struct xfsts_req __user *ureq, bool require_path_target)
 
 		ctx.target_dev = bdev_dev;
 		ctx.found = NULL;
-		iterate_supers_type(xfs_type, find_sb_cb, &ctx);
+		ctx.match_bdev = true;
+		iterate_supers_type(xfs_type, timestomp_find_sb_cb, &ctx);
 		sb = ctx.found;
 		if (!sb)
 			return -ENOENT;
@@ -292,36 +240,18 @@ static int do_stomp(struct xfsts_req __user *ureq, bool require_path_target)
 		}
 
 		if (donor) {
-			if (!req.atime.valid) {
-				struct timespec64 t = inode_get_atime(donor);
-				req.atime.secs = t.tv_sec;
-				req.atime.nsec = t.tv_nsec;
-				req.atime.valid = 1;
-			}
-			if (!req.mtime.valid) {
-				struct timespec64 t = inode_get_mtime(donor);
-				req.mtime.secs = t.tv_sec;
-				req.mtime.nsec = t.tv_nsec;
-				req.mtime.valid = 1;
-			}
-			if (!req.ctime.valid) {
-				struct timespec64 t = inode_get_ctime(donor);
-				req.ctime.secs = t.tv_sec;
-				req.ctime.nsec = t.tv_nsec;
-				req.ctime.valid = 1;
-			}
+			TIMESTOMP_COPY_DONOR_TS(req, donor, atime, inode_get_atime);
+			TIMESTOMP_COPY_DONOR_TS(req, donor, mtime, inode_get_mtime);
+			TIMESTOMP_COPY_DONOR_TS(req, donor, ctime, inode_get_ctime);
 			if (!req.btime.valid)
 				read_btime(donor, &req.btime);
 			iput(donor);
 		}
 	}
 
-	if (req.atime.valid)
-		apply_vfs_ts(target, &req.atime, 'a');
-	if (req.mtime.valid)
-		apply_vfs_ts(target, &req.mtime, 'm');
-	if (req.ctime.valid)
-		apply_vfs_ts(target, &req.ctime, 'c');
+	TIMESTOMP_APPLY_TS(req, target, atime, 'a');
+	TIMESTOMP_APPLY_TS(req, target, mtime, 'm');
+	TIMESTOMP_APPLY_TS(req, target, ctime, 'c');
 	if (req.btime.valid) {
 		ret = write_btime(target, &req.btime);
 		if (ret) {
@@ -376,7 +306,7 @@ static int __init xfsts_init(void)
 {
 	int ret;
 
-	ret = resolve_kallsyms();
+	ret = timestomp_resolve_kallsyms(&xfsts_kallsyms_lookup_name);
 	if (ret)
 		return ret;
 
