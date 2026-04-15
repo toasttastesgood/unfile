@@ -1,0 +1,18 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  userspace-and-shell-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build userspace tools
+        run: make ctl btrfs_ctl
+
+      - name: Shell syntax checks
+        run: bash -n test_ext4_timestomp.sh test_btrfs_timestomp.sh

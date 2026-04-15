@@ -2,13 +2,31 @@
 
 Loadable kernel module for **live** ext4 inode timestamp modification — no unmounting required.
 
+## Btrfs Module
+
+This repo now also includes `btrfs_timestomp.ko`, a separate module for live
+timestamp updates on mounted btrfs filesystems.
+
+- Device node: `/dev/btrfs_timestomp`
+- Supported fields: `atime`, `mtime`, `ctime`, `btime` (`crtime`)
+- Donor mode: supported
+- Preferred target mode: file path (`--path`) via `BTRFSTS_STOMP_PATH`
+- Legacy target mode: inode number (`--inode`) is still supported but
+  deprecated for btrfs and may fail if inode is not cached
+- Verified on: Fedora kernel `6.19.11-200.fc43.x86_64` on **April 15, 2026**
+
 ## Files
 
 | File | Purpose |
 |---|---|
 | `ext4ts.h` | Shared ioctl structure + constants (kernel + userspace) |
+| `btrfsts.h` | Shared ioctl structure + constants for btrfs module |
 | `ext4_timestomp.c` | Kernel module source |
+| `btrfs_timestomp.c` | Btrfs kernel module source |
 | `ext4ts_ctl.c` | Userspace ioctl client |
+| `btrfsts_ctl.c` | Userspace ioctl client for btrfs module |
+| `test_ext4_timestomp.sh` | End-to-end ext4 test harness |
+| `test_btrfs_timestomp.sh` | End-to-end btrfs test harness |
 | `Makefile` | Builds both; auto-detects `i_crtime` offset via BTF/pahole |
 
 ## Requirements
@@ -17,7 +35,8 @@ Loadable kernel module for **live** ext4 inode timestamp modification — no unm
 - Kernel headers matching the running kernel (`linux-headers-$(uname -r)`)
 - `gcc`, `make`
 - `pahole` (optional, for crtime/birth-time support)
-- Root to load the module and use `/dev/ext4_timestomp`
+- `btrfs-progs` (`mkfs.btrfs`) for btrfs test suite
+- Root to load modules and use `/dev/ext4_timestomp` and `/dev/btrfs_timestomp`
 
 ## Build
 
@@ -26,7 +45,7 @@ Loadable kernel module for **live** ext4 inode timestamp modification — no unm
 sudo apt install linux-headers-$(uname -r) pahole
 
 cd lkm/
-make          # builds ext4_timestomp.ko + ext4ts_ctl
+make          # builds ext4_timestomp.ko + btrfs_timestomp.ko + ext4ts_ctl + btrfsts_ctl
 ```
 
 ## Load / Unload
@@ -35,6 +54,51 @@ make          # builds ext4_timestomp.ko + ext4ts_ctl
 sudo insmod ext4_timestomp.ko   # creates /dev/ext4_timestomp
 sudo rmmod  ext4_timestomp
 ```
+
+For btrfs:
+
+```bash
+sudo insmod btrfs_timestomp.ko  # creates /dev/btrfs_timestomp
+sudo rmmod  btrfs_timestomp
+```
+
+## Btrfs Usage
+
+```bash
+# Preferred: path-based target selection
+sudo ./btrfsts_ctl --device /mnt/btrfs --path /mnt/btrfs/example.txt \
+    --ctime 1000000000 --mtime 1000000000 --btime 1000000000 --nsec 0
+```
+
+Donor mode:
+
+```bash
+sudo ./btrfsts_ctl --device /mnt/btrfs --path /mnt/btrfs/receiver.txt \
+    --donor-path /mnt/btrfs/donor.txt
+```
+
+Legacy inode mode (deprecated for btrfs):
+
+```bash
+sudo ./btrfsts_ctl --device /mnt/btrfs --inode 42 --donor 17
+```
+
+## Tests
+
+```bash
+# ext4 suite
+sudo ./test_ext4_timestomp.sh
+
+# btrfs suite (includes positive + negative coverage)
+sudo ./test_btrfs_timestomp.sh
+```
+
+## CI
+
+GitHub Actions workflow: `.github/workflows/ci.yml`
+
+- Build userspace tools: `make ctl btrfs_ctl`
+- Lint shell syntax: `bash -n test_ext4_timestomp.sh test_btrfs_timestomp.sh`
 
 ## Usage
 

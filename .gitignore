@@ -17,6 +17,7 @@ modules.order
 
 # Userspace build output
 ext4ts_ctl
+btrfs_ctl
 
 # Local tooling/state
 .codex
