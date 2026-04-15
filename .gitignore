@@ -17,7 +17,13 @@ modules.order
 
 # Userspace build output
 ext4ts_ctl
-btrfs_ctl
+btrfsts_ctl
+xfsts_ctl
 
 # Local tooling/state
 .codex
+
+# Temporary/local files
+*.tmp
+*.swp
+*.swo

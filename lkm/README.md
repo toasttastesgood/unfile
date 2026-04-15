@@ -15,19 +15,35 @@ timestamp updates on mounted btrfs filesystems.
   deprecated for btrfs and may fail if inode is not cached
 - Verified on: Fedora kernel `6.19.11-200.fc43.x86_64` on **April 15, 2026**
 
+## XFS Module
+
+This repo now also includes `xfs_timestomp.ko`, a separate module for live
+timestamp updates on mounted xfs filesystems.
+
+- Device node: `/dev/xfs_timestomp`
+- Supported fields: `atime`, `mtime`, `ctime`, `btime` (`crtime`)
+- Donor mode: supported
+- Preferred target mode: file path (`--path`) via `XFSTS_STOMP_PATH`
+- Legacy target mode: inode number (`--inode`) is still supported but
+  deprecated for xfs and may fail if inode is not cached
+
 ## Files
 
 | File | Purpose |
 |---|---|
 | `ext4ts.h` | Shared ioctl structure + constants (kernel + userspace) |
 | `btrfsts.h` | Shared ioctl structure + constants for btrfs module |
+| `xfsts.h` | Shared ioctl structure + constants for xfs module |
 | `ext4_timestomp.c` | Kernel module source |
 | `btrfs_timestomp.c` | Btrfs kernel module source |
+| `xfs_timestomp.c` | XFS kernel module source |
 | `ext4ts_ctl.c` | Userspace ioctl client |
 | `btrfsts_ctl.c` | Userspace ioctl client for btrfs module |
+| `xfsts_ctl.c` | Userspace ioctl client for xfs module |
 | `test_ext4_timestomp.sh` | End-to-end ext4 test harness |
 | `test_btrfs_timestomp.sh` | End-to-end btrfs test harness |
-| `Makefile` | Builds both; auto-detects `i_crtime` offset via BTF/pahole |
+| `test_xfs_timestomp.sh` | End-to-end xfs test harness |
+| `Makefile` | Builds all modules and userspace tools |
 
 ## Requirements
 
@@ -36,7 +52,8 @@ timestamp updates on mounted btrfs filesystems.
 - `gcc`, `make`
 - `pahole` (optional, for crtime/birth-time support)
 - `btrfs-progs` (`mkfs.btrfs`) for btrfs test suite
-- Root to load modules and use `/dev/ext4_timestomp` and `/dev/btrfs_timestomp`
+- `xfsprogs` (`mkfs.xfs`) for xfs test suite
+- Root to load modules and use `/dev/ext4_timestomp`, `/dev/btrfs_timestomp`, and `/dev/xfs_timestomp`
 
 ## Build
 
@@ -45,7 +62,7 @@ timestamp updates on mounted btrfs filesystems.
 sudo apt install linux-headers-$(uname -r) pahole
 
 cd lkm/
-make          # builds ext4_timestomp.ko + btrfs_timestomp.ko + ext4ts_ctl + btrfsts_ctl
+make          # builds ext4_timestomp.ko + btrfs_timestomp.ko + xfs_timestomp.ko + ext4ts_ctl + btrfsts_ctl + xfsts_ctl
 ```
 
 ## Load / Unload
@@ -60,6 +77,13 @@ For btrfs:
 ```bash
 sudo insmod btrfs_timestomp.ko  # creates /dev/btrfs_timestomp
 sudo rmmod  btrfs_timestomp
+```
+
+For xfs:
+
+```bash
+sudo insmod xfs_timestomp.ko    # creates /dev/xfs_timestomp
+sudo rmmod  xfs_timestomp
 ```
 
 ## Btrfs Usage
@@ -83,6 +107,21 @@ Legacy inode mode (deprecated for btrfs):
 sudo ./btrfsts_ctl --device /mnt/btrfs --inode 42 --donor 17
 ```
 
+## XFS Usage
+
+```bash
+# Preferred: path-based target selection
+sudo ./xfsts_ctl --device /mnt/xfs --path /mnt/xfs/example.txt \
+    --ctime 1000000000 --mtime 1000000000 --btime 1000000000 --nsec 0
+```
+
+Donor mode:
+
+```bash
+sudo ./xfsts_ctl --device /mnt/xfs --path /mnt/xfs/receiver.txt \
+    --donor-path /mnt/xfs/donor.txt
+```
+
 ## Tests
 
 ```bash
@@ -91,14 +130,17 @@ sudo ./test_ext4_timestomp.sh
 
 # btrfs suite (includes positive + negative coverage)
 sudo ./test_btrfs_timestomp.sh
+
+# xfs suite (includes positive + negative coverage)
+sudo ./test_xfs_timestomp.sh
 ```
 
 ## CI
 
 GitHub Actions workflow: `.github/workflows/ci.yml`
 
-- Build userspace tools: `make ctl btrfs_ctl`
-- Lint shell syntax: `bash -n test_ext4_timestomp.sh test_btrfs_timestomp.sh`
+- Build userspace tools: `make ctl btrfs_ctl xfs_ctl`
+- Lint shell syntax: `bash -n test_ext4_timestomp.sh test_btrfs_timestomp.sh test_xfs_timestomp.sh`
 
 ## Usage
 

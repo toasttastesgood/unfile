@@ -12,7 +12,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build userspace tools
-        run: make ctl btrfs_ctl
+        run: make ctl btrfs_ctl xfs_ctl
 
       - name: Shell syntax checks
-        run: bash -n test_ext4_timestomp.sh test_btrfs_timestomp.sh
+        run: bash -n test_ext4_timestomp.sh test_btrfs_timestomp.sh test_xfs_timestomp.sh

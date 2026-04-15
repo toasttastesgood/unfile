@@ -1,10 +1,11 @@
-# Makefile for ext4_timestomp LKM + userspace ctl tool
+# Makefile for ext4_timestomp/btrfs_timestomp/xfs_timestomp LKMs + userspace ctl tools
 #
 # Usage:
 #   make            — build kernel modules + userspace clients
 #   make modules    — build kernel module only
 #   make ctl        — build ext4 userspace client only
 #   make btrfs_ctl  — build btrfs userspace client only
+#   make xfs_ctl    — build xfs userspace client only
 #   make clean      — remove build artifacts
 #
 # The build auto-detects ext4_inode_info field offsets via BTF (pahole) so
@@ -29,12 +30,19 @@ PWD     := $(shell pwd)
 # The detected values are passed as CFLAGS to the module build.
 
 BTF_FILE    := /sys/kernel/btf/vmlinux
+XFS_BTF_FILE := /sys/kernel/btf/xfs
 VMLINUX     := /boot/vmlinux-$(KVER)
 PAHOLE      := $(shell which pahole 2>/dev/null)
 
 # Attempt BTF-based detection
 define get_offset_btf
 $(shell $(PAHOLE) --btf_base=$(1) -C $(2) 2>/dev/null | \
+	awk '/$(3)[[:space:]]*;/{if (match($$0,/\/\* *([0-9]+)/,a)) print a[1]}')
+endef
+
+# Attempt pahole offsets from a standalone BTF object (e.g., module BTF in /sys/kernel/btf/)
+define get_offset_btf_file
+$(shell $(PAHOLE) -C $(2) $(1) 2>/dev/null | \
 	awk '/$(3)[[:space:]]*;/{if (match($$0,/\/\* *([0-9]+)/,a)) print a[1]}')
 endef
 
@@ -86,6 +94,15 @@ else ifeq ($(wildcard $(VMLINUX)),$(VMLINUX))
 endif
 endif
 
+# xfs offsets from module BTF (for uncached inode fallback through xfs_iget)
+ifneq ($(PAHOLE),)
+ifeq ($(wildcard $(XFS_BTF_FILE)),$(XFS_BTF_FILE))
+  XFS_VFS_INODE_OFFSET   := $(call get_offset_btf_file,$(XFS_BTF_FILE),xfs_inode,i_vnode)
+  XFS_CRTIME_OFFSET      := $(call get_offset_btf_file,$(XFS_BTF_FILE),xfs_inode,i_crtime)
+  $(info [xfsts] xfs BTF: i_vnode=$(XFS_VFS_INODE_OFFSET) i_crtime=$(XFS_CRTIME_OFFSET))
+endif
+endif
+
 # Build the -D flags only when offsets were found
 OFFSET_FLAGS :=
 ifneq ($(CRTIME_OFFSET),)
@@ -103,21 +120,27 @@ ifneq ($(BTRFS_VFS_INODE_OFFSET),)
 endif
 endif
 endif
+ifneq ($(XFS_VFS_INODE_OFFSET),)
+  OFFSET_FLAGS += -DXFS_VFS_INODE_OFFSET=$(XFS_VFS_INODE_OFFSET)
+endif
+ifneq ($(XFS_CRTIME_OFFSET),)
+  OFFSET_FLAGS += -DXFS_CRTIME_OFFSET=$(XFS_CRTIME_OFFSET)
+endif
 
 # --------------------------------------------------------------------------
 # Kernel module build
 # --------------------------------------------------------------------------
-obj-m := ext4_timestomp.o btrfs_timestomp.o
+obj-m := ext4_timestomp.o btrfs_timestomp.o xfs_timestomp.o
 
-ccflags-y := $(OFFSET_FLAGS)
+ccflags-y := -Os $(OFFSET_FLAGS)
 
-.PHONY: all modules ctl btrfs_ctl clean load unload btrfs_load btrfs_unload
+.PHONY: all modules ctl btrfs_ctl xfs_ctl clean load unload btrfs_load btrfs_unload xfs_load xfs_unload
 
-all: modules ctl btrfs_ctl
+all: modules ctl btrfs_ctl xfs_ctl
 
 modules:
 	$(MAKE) -C $(KDIR) M=$(PWD) \
-		EXTRA_CFLAGS="$(OFFSET_FLAGS)" \
+		EXTRA_CFLAGS="-Os $(OFFSET_FLAGS)" \
 		modules
 
 # --------------------------------------------------------------------------
@@ -131,6 +154,11 @@ ext4ts_ctl: ext4ts_ctl.c ext4ts.h
 btrfs_ctl: btrfsts_ctl
 
 btrfsts_ctl: btrfsts_ctl.c btrfsts.h
+	$(CC) $(CFLAGS) -O2 -Wall -Wextra -o $@ $<
+
+xfs_ctl: xfsts_ctl
+
+xfsts_ctl: xfsts_ctl.c xfsts.h
 	$(CC) $(CFLAGS) -O2 -Wall -Wextra -o $@ $<
 
 # --------------------------------------------------------------------------
@@ -148,6 +176,12 @@ btrfs_load: modules
 btrfs_unload:
 	sudo rmmod btrfs_timestomp || true
 
+xfs_load: modules
+	sudo insmod xfs_timestomp.ko
+
+xfs_unload:
+	sudo rmmod xfs_timestomp || true
+
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f ext4ts_ctl btrfsts_ctl
+	rm -f ext4ts_ctl btrfsts_ctl xfsts_ctl

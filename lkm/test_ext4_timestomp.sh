@@ -33,15 +33,15 @@ need_cmd() {
   }
 }
 
-for c in make lsmod grep awk mknod chmod mktemp dd mkfs.ext4 losetup mount umount stat touch sync debugfs; do
+for c in make lsmod grep awk mknod chmod mktemp dd mkfs.ext4 losetup mount umount stat sync debugfs; do
   need_cmd "${c}"
 done
 
 if [[ "${SKIP_BUILD}" -eq 0 ]]; then
-  echo "[1/8] Building module + userspace tool"
+  echo "[1/11] Building module + userspace tool"
   make -j"$(nproc)"
 else
-  echo "[1/8] Skipping build"
+  echo "[1/11] Skipping build"
 fi
 
 if [[ ! -x ./ext4ts_ctl ]]; then
@@ -49,15 +49,21 @@ if [[ ! -x ./ext4ts_ctl ]]; then
   exit 1
 fi
 
-if ! lsmod | grep -q '^ext4_timestomp'; then
+if lsmod | grep -q '^ext4_timestomp'; then
+  if [[ "${SKIP_LOAD}" -eq 1 ]]; then
+    echo "[2/11] Module already loaded (skip-load set)"
+  else
+    echo "[2/11] Reloading ext4_timestomp module"
+    rmmod ext4_timestomp
+    insmod ./ext4_timestomp.ko
+  fi
+else
   if [[ "${SKIP_LOAD}" -eq 1 ]]; then
     echo "Module not loaded and --skip-load was set." >&2
     exit 1
   fi
-  echo "[2/8] Loading ext4_timestomp module"
+  echo "[2/11] Loading ext4_timestomp module"
   insmod ./ext4_timestomp.ko
-else
-  echo "[2/8] Module already loaded"
 fi
 
 minor="$(awk '$2 == "ext4_timestomp" { print $1 }' /proc/misc | head -n1)"
@@ -67,7 +73,7 @@ if [[ -z "${minor}" ]]; then
 fi
 
 if [[ ! -e /dev/ext4_timestomp ]]; then
-  echo "[3/8] Creating /dev/ext4_timestomp (major 10 minor ${minor})"
+  echo "[3/11] Creating /dev/ext4_timestomp (major 10 minor ${minor})"
   mknod /dev/ext4_timestomp c 10 "${minor}"
 fi
 chmod 600 /dev/ext4_timestomp
@@ -75,10 +81,15 @@ chmod 600 /dev/ext4_timestomp
 TMPDIR="$(mktemp -d /tmp/ext4ts-test.XXXXXX)"
 IMG="${TMPDIR}/fs.img"
 MNT="${TMPDIR}/mnt"
+OTHER_MNT="${TMPDIR}/other_mnt"
 LOOPDEV=""
 MOUNTED=0
+OTHER_MOUNTED=0
 
 cleanup() {
+  if [[ "${OTHER_MOUNTED}" -eq 1 ]]; then
+    umount "${OTHER_MNT}" || true
+  fi
   if [[ "${MOUNTED}" -eq 1 ]]; then
     umount "${MNT}" || true
   fi
@@ -93,31 +104,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "[4/8] Creating loopback ext4 test filesystem"
-dd if=/dev/zero of="${IMG}" bs=1M count=64 status=none
-mkfs.ext4 -F -q "${IMG}"
-LOOPDEV="$(losetup --find --show "${IMG}")"
-mkdir -p "${MNT}"
-mount -t ext4 -o noatime,nodiratime "${LOOPDEV}" "${MNT}"
-MOUNTED=1
-
-echo "[5/8] Creating per-field target files"
-echo "atime-target"  > "${MNT}/atime.txt"
-echo "mtime-target"  > "${MNT}/mtime.txt"
-echo "ctime-target"  > "${MNT}/ctime.txt"
-echo "crtime-target" > "${MNT}/crtime.txt"
-sync
-
-atime_ino="$(stat -c '%i' "${MNT}/atime.txt")"
-mtime_ino="$(stat -c '%i' "${MNT}/mtime.txt")"
-ctime_ino="$(stat -c '%i' "${MNT}/ctime.txt")"
-crtime_ino="$(stat -c '%i' "${MNT}/crtime.txt")"
-
-echo "    atime inode:  ${atime_ino}"
-echo "    mtime inode:  ${mtime_ino}"
-echo "    ctime inode:  ${ctime_ino}"
-echo "    crtime inode: ${crtime_ino}"
-
 assert_eq() {
   local label="$1"
   local expected="$2"
@@ -127,11 +113,6 @@ assert_eq() {
     exit 1
   fi
   echo "PASS: ${label} = ${actual}"
-}
-
-get_crtime_line() {
-  local ino="$1"
-  debugfs -R "stat <${ino}>" "${LOOPDEV}" 2>/dev/null | awk '/crtime:/ {print; exit}'
 }
 
 assert_ne() {
@@ -145,7 +126,53 @@ assert_ne() {
   echo "PASS: ${label} changed"
 }
 
-echo "[6/8] Individual atime test (only atime changes)"
+assert_fail() {
+  local label="$1"
+  shift
+  if "$@"; then
+    echo "FAIL: ${label} (unexpected success)" >&2
+    exit 1
+  fi
+  echo "PASS: ${label} failed as expected"
+}
+
+get_crtime_line() {
+  local ino="$1"
+  debugfs -R "stat <${ino}>" "${LOOPDEV}" 2>/dev/null | awk '/crtime:/ {print; exit}'
+}
+
+echo "[4/11] Creating loopback ext4 test filesystem"
+dd if=/dev/zero of="${IMG}" bs=1M count=64 status=none
+mkfs.ext4 -F -q "${IMG}"
+LOOPDEV="$(losetup --find --show "${IMG}")"
+mkdir -p "${MNT}"
+mount -t ext4 -o noatime,nodiratime "${LOOPDEV}" "${MNT}"
+MOUNTED=1
+
+echo "[5/11] Creating target and donor files"
+echo "atime-target"  > "${MNT}/atime.txt"
+echo "mtime-target"  > "${MNT}/mtime.txt"
+echo "ctime-target"  > "${MNT}/ctime.txt"
+echo "crtime-target" > "${MNT}/crtime.txt"
+echo "donor-file"    > "${MNT}/donor.txt"
+echo "recv-file"     > "${MNT}/receiver.txt"
+sync
+
+atime_ino="$(stat -c '%i' "${MNT}/atime.txt")"
+mtime_ino="$(stat -c '%i' "${MNT}/mtime.txt")"
+ctime_ino="$(stat -c '%i' "${MNT}/ctime.txt")"
+crtime_ino="$(stat -c '%i' "${MNT}/crtime.txt")"
+donor_ino="$(stat -c '%i' "${MNT}/donor.txt")"
+recv_ino="$(stat -c '%i' "${MNT}/receiver.txt")"
+
+echo "    atime inode:    ${atime_ino}"
+echo "    mtime inode:    ${mtime_ino}"
+echo "    ctime inode:    ${ctime_ino}"
+echo "    crtime inode:   ${crtime_ino}"
+echo "    donor inode:    ${donor_ino}"
+echo "    receiver inode: ${recv_ino}"
+
+echo "[6/11] Individual atime test (only atime changes)"
 ATIME_SET=1609459201
 read -r a0 m0 c0 < <(stat -c '%X %Y %Z' "${MNT}/atime.txt")
 cr0="$(get_crtime_line "${atime_ino}")"
@@ -158,7 +185,7 @@ assert_eq "atime test mtime unchanged" "${m0}" "${m1}"
 assert_eq "atime test ctime unchanged" "${c0}" "${c1}"
 assert_eq "atime test crtime unchanged" "${cr0}" "${cr1}"
 
-echo "[7/8] Individual mtime test (only mtime changes)"
+echo "[7/11] Individual mtime test (only mtime changes)"
 MTIME_SET=1609459202
 read -r a0 m0 c0 < <(stat -c '%X %Y %Z' "${MNT}/mtime.txt")
 cr0="$(get_crtime_line "${mtime_ino}")"
@@ -171,7 +198,7 @@ assert_eq "mtime target value" "${MTIME_SET}" "${m1}"
 assert_eq "mtime test ctime unchanged" "${c0}" "${c1}"
 assert_eq "mtime test crtime unchanged" "${cr0}" "${cr1}"
 
-echo "[8/8] Individual ctime/crtime tests"
+echo "[8/11] Individual ctime/crtime tests"
 CTIME_SET=1609459203
 read -r a0 m0 c0 < <(stat -c '%X %Y %Z' "${MNT}/ctime.txt")
 cr0="$(get_crtime_line "${ctime_ino}")"
@@ -207,4 +234,48 @@ else
   echo "WARN: stat %W unsupported on this mount/kernel; relied on debugfs crtime change check"
 fi
 
-echo "All per-field isolation tests passed."
+echo "[9/11] Donor mode test (copy all timestamps)"
+DONOR_A=1609459301
+DONOR_M=1609459302
+DONOR_C=1609459303
+DONOR_CR=1609459304
+./ext4ts_ctl --device "${LOOPDEV}" --inode "${donor_ino}" --atime "${DONOR_A}" --nsec 111111111
+./ext4ts_ctl --device "${LOOPDEV}" --inode "${donor_ino}" --mtime "${DONOR_M}" --nsec 222222222
+./ext4ts_ctl --device "${LOOPDEV}" --inode "${donor_ino}" --ctime "${DONOR_C}" --nsec 333333333
+./ext4ts_ctl --device "${LOOPDEV}" --inode "${donor_ino}" --crtime "${DONOR_CR}" --nsec 444444444
+sync
+
+read -r da dm dc < <(stat -c '%X %Y %Z' "${MNT}/donor.txt")
+dcr="$(get_crtime_line "${donor_ino}")"
+db="$(stat -c '%W' "${MNT}/donor.txt")"
+./ext4ts_ctl --device "${LOOPDEV}" --inode "${recv_ino}" --donor "${donor_ino}"
+sync
+read -r ra rm rc < <(stat -c '%X %Y %Z' "${MNT}/receiver.txt")
+rcr="$(get_crtime_line "${recv_ino}")"
+rb="$(stat -c '%W' "${MNT}/receiver.txt")"
+assert_eq "donor copy atime" "${da}" "${ra}"
+assert_eq "donor copy mtime" "${dm}" "${rm}"
+assert_eq "donor copy ctime" "${dc}" "${rc}"
+if [[ -n "${dcr}" && -n "${rcr}" ]]; then
+  assert_eq "donor copy crtime (debugfs)" "${dcr}" "${rcr}"
+else
+  echo "WARN: debugfs crtime unavailable; skipping donor crtime comparison"
+fi
+if [[ "${db}" != "-1" && "${rb}" != "-1" ]]; then
+  assert_eq "donor copy crtime (stat %W)" "${db}" "${rb}"
+else
+  echo "WARN: stat %W unsupported; relied on debugfs donor crtime comparison"
+fi
+
+echo "[10/11] Negative test: invalid inode should fail"
+assert_fail "invalid inode" \
+  ./ext4ts_ctl --device "${LOOPDEV}" --inode 999999999 --atime 1609459401 --nsec 1
+
+echo "[11/11] Negative test: non-ext4 device should fail"
+mkdir -p "${OTHER_MNT}"
+mount -t tmpfs -o size=8M tmpfs "${OTHER_MNT}"
+OTHER_MOUNTED=1
+assert_fail "non-ext4 mountpoint device" \
+  ./ext4ts_ctl --device "${OTHER_MNT}" --inode "${recv_ino}" --atime 1609459402 --nsec 2
+
+echo "All ext4 timestamp tests passed."

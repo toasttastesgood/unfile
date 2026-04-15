@@ -11,26 +11,31 @@
 #include <linux/kprobes.h>
 #include <linux/blkdev.h>
 
-#include "btrfsts.h"
+#include "xfsts.h"
 
-#if defined(BTRFS_OTIME_SEC_OFFSET) && defined(BTRFS_OTIME_NSEC_OFFSET) && \
-	defined(BTRFS_VFS_INODE_OFFSET)
-#define BTRFS_HAVE_BTIME_OFFSETS 1
+#if defined(XFS_VFS_INODE_OFFSET)
+#define XFSTS_HAVE_XFS_IGET_OFFSETS 1
 #else
-#define BTRFS_HAVE_BTIME_OFFSETS 0
-#ifndef BTRFS_OTIME_SEC_OFFSET
-#define BTRFS_OTIME_SEC_OFFSET 0
+#define XFSTS_HAVE_XFS_IGET_OFFSETS 0
+#ifndef XFS_VFS_INODE_OFFSET
+#define XFS_VFS_INODE_OFFSET 0
 #endif
-#ifndef BTRFS_OTIME_NSEC_OFFSET
-#define BTRFS_OTIME_NSEC_OFFSET 0
 #endif
-#ifndef BTRFS_VFS_INODE_OFFSET
-#define BTRFS_VFS_INODE_OFFSET 0
+
+#if defined(XFS_VFS_INODE_OFFSET) && defined(XFS_CRTIME_OFFSET)
+#define XFSTS_HAVE_BTIME_OFFSETS 1
+#else
+#define XFSTS_HAVE_BTIME_OFFSETS 0
+#ifndef XFS_CRTIME_OFFSET
+#define XFS_CRTIME_OFFSET 0
 #endif
 #endif
 
 typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
-static kallsyms_lookup_name_t btrfsts_kallsyms_lookup_name;
+static kallsyms_lookup_name_t xfsts_kallsyms_lookup_name;
+typedef int (*xfs_iget_t)(void *mp, void *tp, __u64 ino, unsigned int flags,
+			  unsigned int lock_flags, void **ipp);
+typedef void (*xfs_irele_t)(void *ip);
 
 struct find_sb_ctx {
 	dev_t target_dev;
@@ -48,16 +53,16 @@ static int __init resolve_kallsyms(void)
 	if (ret < 0)
 		return ret;
 
-	btrfsts_kallsyms_lookup_name = (kallsyms_lookup_name_t)kp.addr;
+	xfsts_kallsyms_lookup_name = (kallsyms_lookup_name_t)kp.addr;
 	unregister_kprobe(&kp);
 	return 0;
 }
 
 static unsigned long sym_addr(const char *name)
 {
-	if (!btrfsts_kallsyms_lookup_name)
+	if (!xfsts_kallsyms_lookup_name)
 		return 0;
-	return btrfsts_kallsyms_lookup_name(name);
+	return xfsts_kallsyms_lookup_name(name);
 }
 
 static void find_sb_cb(struct super_block *sb, void *arg)
@@ -71,7 +76,7 @@ static void find_sb_cb(struct super_block *sb, void *arg)
 		ctx->found = sb;
 }
 
-static void apply_vfs_ts(struct inode *inode, const struct btrfsts_ts *ts, char which)
+static void apply_vfs_ts(struct inode *inode, const struct xfsts_ts *ts, char which)
 {
 	struct timespec64 t = {
 		.tv_sec = ts->secs,
@@ -91,47 +96,97 @@ static void apply_vfs_ts(struct inode *inode, const struct btrfsts_ts *ts, char 
 	}
 }
 
-static int read_btime(struct inode *inode, struct btrfsts_ts *out)
+static int read_btime(struct inode *inode, struct xfsts_ts *out)
 {
-#if !BTRFS_HAVE_BTIME_OFFSETS
+#if !XFSTS_HAVE_BTIME_OFFSETS
 	(void)inode;
 	(void)out;
 	return -EOPNOTSUPP;
 #else
-	char *bi = (char *)inode - BTRFS_VFS_INODE_OFFSET;
-	__s64 *sec_ptr = (__s64 *)(bi + BTRFS_OTIME_SEC_OFFSET);
-	__u32 *nsec_ptr = (__u32 *)(bi + BTRFS_OTIME_NSEC_OFFSET);
+	char *xi = (char *)inode - XFS_VFS_INODE_OFFSET;
+	struct timespec64 *crtime_ptr = (struct timespec64 *)(xi + XFS_CRTIME_OFFSET);
 
-	out->secs = *sec_ptr;
-	out->nsec = *nsec_ptr;
+	out->secs = crtime_ptr->tv_sec;
+	out->nsec = crtime_ptr->tv_nsec;
 	out->valid = 1;
 	return 0;
 #endif
 }
 
-static int write_btime(struct inode *inode, const struct btrfsts_ts *ts)
+static int write_btime(struct inode *inode, const struct xfsts_ts *ts)
 {
-#if !BTRFS_HAVE_BTIME_OFFSETS
+#if !XFSTS_HAVE_BTIME_OFFSETS
 	(void)inode;
 	(void)ts;
 	return -EOPNOTSUPP;
 #else
-	char *bi = (char *)inode - BTRFS_VFS_INODE_OFFSET;
-	__s64 *sec_ptr = (__s64 *)(bi + BTRFS_OTIME_SEC_OFFSET);
-	__u32 *nsec_ptr = (__u32 *)(bi + BTRFS_OTIME_NSEC_OFFSET);
+	char *xi = (char *)inode - XFS_VFS_INODE_OFFSET;
+	struct timespec64 *crtime_ptr = (struct timespec64 *)(xi + XFS_CRTIME_OFFSET);
 
 	if (ts->nsec > 999999999U)
 		return -EINVAL;
 
-	*sec_ptr = ts->secs;
-	*nsec_ptr = ts->nsec;
+	crtime_ptr->tv_sec = ts->secs;
+	crtime_ptr->tv_nsec = ts->nsec;
 	return 0;
 #endif
 }
 
-static int do_stomp(struct btrfsts_req __user *ureq, bool require_path_target)
+static void *xfs_mount_from_sb(struct super_block *sb)
 {
-	struct btrfsts_req req;
+	return sb->s_fs_info;
+}
+
+static struct inode *xfs_inode_to_vfs_inode(void *xip)
+{
+#if !XFSTS_HAVE_XFS_IGET_OFFSETS
+	(void)xip;
+	return NULL;
+#else
+	return (struct inode *)((char *)xip + XFS_VFS_INODE_OFFSET);
+#endif
+}
+
+static struct inode *xfs_lookup_inode_uncached(struct super_block *sb, __u64 ino)
+{
+	xfs_iget_t xfs_iget_fn = (xfs_iget_t)sym_addr("xfs_iget");
+	xfs_irele_t xfs_irele_fn = (xfs_irele_t)sym_addr("xfs_irele");
+	void *xmp;
+	void *xip = NULL;
+	struct inode *vfs_inode;
+	struct inode *held;
+	int ret;
+
+	if (!xfs_iget_fn || !xfs_irele_fn)
+		return ERR_PTR(-ENOENT);
+
+	xmp = xfs_mount_from_sb(sb);
+	if (!xmp)
+		return ERR_PTR(-EOPNOTSUPP);
+
+	ret = xfs_iget_fn(xmp, NULL, ino, 0, 0, &xip);
+	if (ret)
+		return ERR_PTR(ret);
+	if (!xip)
+		return ERR_PTR(-ENOENT);
+
+	vfs_inode = xfs_inode_to_vfs_inode(xip);
+	if (!vfs_inode || vfs_inode->i_sb != sb) {
+		xfs_irele_fn(xip);
+		return ERR_PTR(-ENOENT);
+	}
+
+	held = igrab(vfs_inode);
+	xfs_irele_fn(xip);
+	if (!held)
+		return ERR_PTR(-ENOENT);
+
+	return held;
+}
+
+static int do_stomp(struct xfsts_req __user *ureq, bool require_path_target)
+{
+	struct xfsts_req req;
 	struct path path;
 	struct path tpath;
 	struct path dpath;
@@ -139,7 +194,7 @@ static int do_stomp(struct btrfsts_req __user *ureq, bool require_path_target)
 	struct inode *target = NULL;
 	struct inode *donor = NULL;
 	struct find_sb_ctx ctx;
-	struct file_system_type *btrfs_type;
+	struct file_system_type *xfs_type;
 	int ret;
 
 	if (copy_from_user(&req, ureq, sizeof(req)))
@@ -163,13 +218,13 @@ static int do_stomp(struct btrfsts_req __user *ureq, bool require_path_target)
 
 		path_put(&path);
 
-		btrfs_type = (struct file_system_type *)sym_addr("btrfs_fs_type");
-		if (!btrfs_type)
+		xfs_type = (struct file_system_type *)sym_addr("xfs_fs_type");
+		if (!xfs_type)
 			return -ENOENT;
 
 		ctx.target_dev = bdev_dev;
 		ctx.found = NULL;
-		iterate_supers_type(btrfs_type, find_sb_cb, &ctx);
+		iterate_supers_type(xfs_type, find_sb_cb, &ctx);
 		sb = ctx.found;
 		if (!sb)
 			return -ENOENT;
@@ -178,7 +233,7 @@ static int do_stomp(struct btrfsts_req __user *ureq, bool require_path_target)
 		path_put(&path);
 	}
 
-	if (strcmp(sb->s_type->name, "btrfs") != 0)
+	if (strcmp(sb->s_type->name, "xfs") != 0)
 		return -EINVAL;
 
 	if (require_path_target && !req.target[0])
@@ -189,7 +244,7 @@ static int do_stomp(struct btrfsts_req __user *ureq, bool require_path_target)
 		if (ret)
 			return ret;
 		if (!tpath.dentry->d_sb || tpath.dentry->d_sb != sb ||
-		    strcmp(tpath.dentry->d_sb->s_type->name, "btrfs") != 0) {
+		    strcmp(tpath.dentry->d_sb->s_type->name, "xfs") != 0) {
 			path_put(&tpath);
 			return -EXDEV;
 		}
@@ -200,8 +255,11 @@ static int do_stomp(struct btrfsts_req __user *ureq, bool require_path_target)
 		req.ino = target->i_ino;
 	} else {
 		target = ilookup(sb, (unsigned long)req.ino);
-		if (!target)
-			return -ENOENT;
+		if (!target) {
+			target = xfs_lookup_inode_uncached(sb, req.ino);
+			if (IS_ERR(target))
+				return PTR_ERR(target);
+		}
 	}
 
 	if (req.donor_path[0] || req.donor_ino) {
@@ -212,7 +270,7 @@ static int do_stomp(struct btrfsts_req __user *ureq, bool require_path_target)
 				return ret;
 			}
 			if (!dpath.dentry->d_sb || dpath.dentry->d_sb != sb ||
-			    strcmp(dpath.dentry->d_sb->s_type->name, "btrfs") != 0) {
+			    strcmp(dpath.dentry->d_sb->s_type->name, "xfs") != 0) {
 				path_put(&dpath);
 				iput(target);
 				return -EXDEV;
@@ -226,6 +284,11 @@ static int do_stomp(struct btrfsts_req __user *ureq, bool require_path_target)
 			req.donor_ino = donor->i_ino;
 		} else {
 			donor = ilookup(sb, (unsigned long)req.donor_ino);
+			if (!donor) {
+				donor = xfs_lookup_inode_uncached(sb, req.donor_ino);
+				if (IS_ERR(donor))
+					donor = NULL;
+			}
 		}
 
 		if (donor) {
@@ -282,34 +345,34 @@ static int do_stomp(struct btrfsts_req __user *ureq, bool require_path_target)
 	return 0;
 }
 
-static long btrfsts_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+static long xfsts_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	switch (cmd) {
-	case BTRFSTS_STOMP:
-		return do_stomp((struct btrfsts_req __user *)arg, false);
-	case BTRFSTS_STOMP_PATH:
-		return do_stomp((struct btrfsts_req __user *)arg, true);
+	case XFSTS_STOMP:
+		return do_stomp((struct xfsts_req __user *)arg, false);
+	case XFSTS_STOMP_PATH:
+		return do_stomp((struct xfsts_req __user *)arg, true);
 	default:
 		return -ENOTTY;
 	}
 }
 
-static const struct file_operations btrfsts_fops = {
+static const struct file_operations xfsts_fops = {
 	.owner = THIS_MODULE,
-	.unlocked_ioctl = btrfsts_ioctl,
+	.unlocked_ioctl = xfsts_ioctl,
 #ifdef CONFIG_COMPAT
-	.compat_ioctl = btrfsts_ioctl,
+	.compat_ioctl = xfsts_ioctl,
 #endif
 };
 
-static struct miscdevice btrfsts_miscdev = {
+static struct miscdevice xfsts_miscdev = {
 	.minor = MISC_DYNAMIC_MINOR,
-	.name = BTRFSTS_DEV_NAME,
-	.fops = &btrfsts_fops,
+	.name = XFSTS_DEV_NAME,
+	.fops = &xfsts_fops,
 	.mode = 0600,
 };
 
-static int __init btrfsts_init(void)
+static int __init xfsts_init(void)
 {
 	int ret;
 
@@ -317,15 +380,15 @@ static int __init btrfsts_init(void)
 	if (ret)
 		return ret;
 
-	return misc_register(&btrfsts_miscdev);
+	return misc_register(&xfsts_miscdev);
 }
 
-static void __exit btrfsts_exit(void)
+static void __exit xfsts_exit(void)
 {
-	misc_deregister(&btrfsts_miscdev);
+	misc_deregister(&xfsts_miscdev);
 }
 
-module_init(btrfsts_init);
-module_exit(btrfsts_exit);
+module_init(xfsts_init);
+module_exit(xfsts_exit);
 
 MODULE_LICENSE("GPL");
